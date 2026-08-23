@@ -1,0 +1,17 @@
+# 密钥/配置/运行态一律不入库
+secret.key
+config.sh
+bots.json
+seen_task_ids.txt
+.land.lock
+__pycache__/
+*.pyc
+# 邮箱与运行产物
+inbox/
+outbox/
+delivered/
+threads/
+state/
+logs/
+bus/
+relay/
