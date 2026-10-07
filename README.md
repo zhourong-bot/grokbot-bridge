@@ -116,3 +116,19 @@ The messaging substrate is textbook: a local **transactional outbox** + **Maildi
 ## License
 
 MIT — see [LICENSE](LICENSE).
+# 有界门铃重试
+
+`reconcile.py` 对未回流的 stale outbox 任务按文件名 task id 持久化
+`state/nudge_attempts.json`：首次 stale 时间、重叮次数、上次重叮时间和耗尽状态。
+每个任务最多重叮 3 次，指数退避基础 60 秒、上限 300 秒；第三次后仍等待
+240 秒回流，首次 stale 起绝对 TTL 为 900 秒。网络失败也消耗次数；没有 webhook
+仍受 TTL 限制。正常的 delivered/seen 归档优先于耗尽检查。
+
+耗尽的原始信封保留在 `outbox/failed`，附 `.reason`，并写一次 bus error。
+使用 `python3 bridge/dlq.py --outbox list` 查看；人工核查后如需重新发起，使用新的
+task id，避免无意重置预算。终态记录保留以阻止同一 task id 再次无限重叮。
+重试状态损坏或写入失败时停止本轮，避免重置预算；重叮状态与 POST 由独立文件锁串行化。
+错误事件沿用现有 best-effort bus；异常中断时优先保证不重复发送，不能保证事件一定写入。
+
+回归测试：`python3 -m unittest discover -s tests -v`（标准库，无真实 webhook 调用）。
+

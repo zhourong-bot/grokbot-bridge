@@ -21,6 +21,10 @@ ATT = BRIDGE / "state" / "orphan_attempts.json"
 DELIV = BRIDGE / "delivered"
 LOG = BRIDGE / "logs" / "reconcile.log"
 MAX_ATTEMPT = 3
+NUDGE_MAX = 3
+NUDGE_BASE_S = 60
+NUDGE_CAP_S = 300
+NUDGE_TTL_S = 900
 
 
 def logline(msg):
@@ -163,11 +167,31 @@ def check_run_pending():
 
 
 def nudge_stale():
+    # Serialize state + POST across overlapping reconcile processes. Fail closed
+    # if persisted state cannot be read; never silently reset a retry budget.
+    state_dir = BRIDGE / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with open(state_dir / "nudge.lock", "a+") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        _nudge_stale_locked(state_dir / "nudge_attempts.json")
+
+
+def _save_nudges(path, state):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _nudge_stale_locked(state_path):
     """门铃兜底 + M5: 已回流的归档不空叮, 只叮真正卡着的。"""
     new = BRIDGE / "outbox" / "new"
     if not new.is_dir():
         return
     now = time.time()
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
     seen = seen_set()
     done_dir = BRIDGE / "outbox" / "done"
     really_stale = []
@@ -176,10 +200,39 @@ def nudge_stale():
         # M5: 已 delivered 或已 seen = 对方已处理, 归档, 别再叮。
         if (DELIV / (stem + ".md")).exists() or stem in seen:
             finish(p, done_dir)
+            state.pop(stem, None)
             logline("[outbox-archived] %s (已回流)" % p.name)
             continue
-        if now - p.stat().st_mtime >= T:
+        row = state.get(stem)
+        if row is None and now - p.stat().st_mtime >= T:
+            row = state[stem] = {"first_stale_ts": now, "nudge_count": 0,
+                                 "last_nudge_ts": None, "exhausted": False}
+        if row is None:
+            continue
+        count = row["nudge_count"]
+        delay = min(NUDGE_CAP_S, NUDGE_BASE_S * 2 ** max(0, count - 1))
+        ttl_expired = now >= row["first_stale_ts"] + NUDGE_TTL_S
+        budget_expired = count >= NUDGE_MAX and now >= row["last_nudge_ts"] + delay
+        if row["exhausted"] or ttl_expired or budget_expired:
+            # Durable terminal marker before moving: a crash cannot restart POSTs.
+            row["exhausted"] = True
+            _save_nudges(state_path, state)
+            failed = BRIDGE / "outbox" / "failed"
+            failed.mkdir(parents=True, exist_ok=True)
+            reason = "nudge exhausted: %s; count=%d; first_stale_ts=%s\n" % (
+                "TTL" if ttl_expired else "retry budget", count, row["first_stale_ts"])
+            (failed / (p.name + ".reason")).write_text(reason, encoding="utf-8")
+            finish(p, failed)
+            if not row.get("error_emitted"):
+                row["error_emitted"] = True
+                _save_nudges(state_path, state)
+                bus("error", "outbox nudge 耗尽进 failed: %s" % p.name,
+                    {"task_id": stem, **row})
+                logline("[outbox->failed] %s %s" % (p.name, reason.strip()))
+            continue
+        if count == 0 or now >= row["last_nudge_ts"] + delay:
             really_stale.append(p)
+    _save_nudges(state_path, state)
     if not really_stale:
         return
     url, key = resolve_webhook()
@@ -189,6 +242,11 @@ def nudge_stale():
     req.add_header("Content-Type", "application/json")
     if key:
         req.add_header("Authorization", "Bearer " + key)
+    # Count attempts before I/O, including failed POSTs and interrupted processes.
+    for p in really_stale:
+        state[p.stem]["nudge_count"] += 1
+        state[p.stem]["last_nudge_ts"] = now
+    _save_nudges(state_path, state)
     try:
         urllib.request.urlopen(req, timeout=15).read()
         logline("nudge once for %d stale %s" % (len(really_stale), [x.name for x in really_stale]))

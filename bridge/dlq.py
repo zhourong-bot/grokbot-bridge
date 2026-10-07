@@ -4,6 +4,7 @@
   dlq.py list                 列出死信 + 失败原因
   dlq.py retry <name|all>     把死信移回 inbox/new 重新处理(会重新验签+扫描)
   dlq.py purge <name|all>     永久删除死信(不可恢复)
+  dlq.py --outbox list        查看门铃重试耗尽的 outbox 死信(只读)
 """
 import sys, json, pathlib
 
@@ -17,7 +18,14 @@ def items():
 
 
 def main():
+    global FAILED
     a = sys.argv[1:]
+    if a and a[0] == "--outbox":
+        FAILED = BRIDGE / "outbox" / "failed"
+        a = a[1:]
+        if a and a != ["list"]:
+            print("outbox 死信只支持 list; 重投需人工核查并使用新的 task id")
+            sys.exit(2)
     cmd = a[0] if a else "list"
     if cmd == "list":
         its = items()
